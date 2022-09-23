@@ -1,0 +1,177 @@
+version: "3.9"
+services:
+
+  # OpenSSL self-signed certificates
+  openssl-init:
+    image: alpine/openssl
+    environment:
+      - MINIO_ENDPOINT=minio-service
+    volumes:
+      - openssl_certs:/etc/ssl/certs/
+    command: req -x509 -nodes -days 365 -subj "/C=CA/ST=QC/O=Company, Inc./CN=minio-service" -addext "subjectAltName=DNS:minio-service" -newkey rsa:2048 -keyout /etc/ssl/certs/private.key -out /etc/ssl/certs/public.crt
+    deploy:
+      restart_policy:
+        condition: none
+
+  # MinIO Web Console
+  # http://localhost:9001
+  minio-service:
+    image: minio/minio:RELEASE.2022-05-26T05-48-41Z
+    depends_on:
+      - openssl-init
+      - mq-service
+    ports:
+      - "9000:9000"
+      - "9001:9001"
+    healthcheck:
+      test: ["CMD", "curl", "--silent", "--insecure", "-f", "https://localhost:9000/minio/health/live"]
+      interval: 30s
+      timeout: 20s
+      retries: 3
+    environment:
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=XctaLnbgqf46DZnz
+      - MINIO_SERVER_URL=https://minio-service:9000
+    volumes:
+      - type: bind
+        source: ./docker-compose_minio-service_entrypoint.sh
+        target: /root/docker-compose_minio-service_entrypoint.sh
+      - openssl_certs:/root/.minio/certs
+      - minio_service_data:/data
+    entrypoint:
+      - /root/docker-compose_minio-service_entrypoint.sh
+    restart: on-failure
+
+  # MinIO Service initialization
+  minio-service-init:
+    image: minio/mc:RELEASE.2022-05-09T04-08-26Z
+    depends_on:
+      - minio-service
+    environment:
+      - MINIO_SERVER_URL=https://minio-service:9000
+      - MINIO_ROOT_USER=minioadmin
+      - MINIO_ROOT_PASSWORD=XctaLnbgqf46DZnz
+      - MINIO_USER_NAME=miniouser
+      - MINIO_USER_PASSWORD=LIia7mr7e1WD4R4Q
+      - MINIO_BUCKET_NAME=storagebucket
+      - RABBITMQ_ENDPOINT=mq-service
+      - RABBITMQ_PORT=15672
+      - RABBITMQ_REGULAR_USER_NAME=rabbituser
+      - RABBITMQ_REGULAR_USER_PASS=HMSXzseT9j93JG2u
+      - RABBITMQ_QUEUE_ROUTING_KEY=bucket_notifications
+    volumes:
+      - type: bind
+        source: ./docker-compose_minio-service-init_entrypoint.sh
+        target: /root/docker-compose_minio-service-init_entrypoint.sh
+    entrypoint:
+      - /root/docker-compose_minio-service-init_entrypoint.sh
+    deploy:
+      restart_policy:
+        condition: none
+
+  # RabbitMQ Web Console
+  # http://localhost:15672
+  mq-service:
+    image: rabbitmq:3.8-management-alpine
+    ports:
+      - 15672:15672
+    volumes:
+      - rabbitmq_service_log:/var/log/rabbitmq
+      - rabbitmq_service_queue:/var/lib/rabbitmq
+    healthcheck:
+      test: rabbitmq-diagnostics -q ping
+      interval: 30s
+      timeout: 30s
+      retries: 3
+    environment:
+      - RABBITMQ_DEFAULT_USER=rabbitadmin
+      - RABBITMQ_DEFAULT_PASS=KJyRwwcFJ76BzJ7H
+      - RABBITMQ_SERVER_ADDITIONAL_ERL_ARGS=-rabbit log [{console,[{level,error}]}]
+    restart: on-failure
+
+  # RabbitMQ Service initialization
+  mq-service-init:
+    image: rabbitmq:3.8-management-alpine
+    depends_on:
+      - mq-service
+    volumes:
+      - type: bind
+        source: ./docker-compose_mq-service-init_entrypoint.sh
+        target: /root/docker-compose_mq-service-init_entrypoint.sh
+    environment:
+      - RABBITMQ_ENDPOINT=mq-service
+      - RABBITMQ_PORT_MANAGEMENT=15672
+      - RABBITMQ_DEFAULT_USER=rabbitadmin
+      - RABBITMQ_DEFAULT_PASS=KJyRwwcFJ76BzJ7H
+      - RABBITMQ_REGULAR_USER_NAME=rabbituser
+      - RABBITMQ_REGULAR_USER_PASS=HMSXzseT9j93JG2u
+      - RABBITMQ_QUEUE_NAME=s3minioqueue
+      - RABBITMQ_TOPIC=s3minioscan
+    entrypoint:
+      - /root/docker-compose_mq-service-init_entrypoint.sh
+    deploy:
+      restart_policy:
+        condition: none
+
+  # Ruby script automating the scan on each put event trigger
+  avscan-script:
+    image: ruby:2.7.0
+    depends_on:
+      - openssl-init
+      - minio-service
+      - mq-service
+    platform: linux/amd64
+    ports:
+      - "8080:8080"
+    volumes:
+      - type: bind
+        source: ./docker-compose_avscan-script_entrypoint.sh
+        target: /root/docker-compose_avscan-script_entrypoint.sh
+    environment:
+      - MINIO_SERVER_URL=https://minio-service:9000
+      - MINIO_ACCESS_KEY_ID=miniouser
+      - MINIO_SECRET_ACCESS_KEY=LIia7mr7e1WD4R4Q
+      - MINIO_REGION=eu-west-1
+      - RABBITMQ_ENDPOINT=mq-service
+      - RABBITMQ_PORT=5672
+      - RABBITMQ_REGULAR_USER_NAME=rabbituser
+      - RABBITMQ_REGULAR_USER_PASS=HMSXzseT9j93JG2u
+      - RABBITMQ_QUEUE_NAME=s3minioqueue
+      - RABBITMQ_TOPIC=s3minioscan
+      - CLAMD_ENDPOINT=clamd-service
+      - CLAMD_PORT=9443
+      - DELETE_FILE=true
+      - REPORT_CLEAN=false
+      - TAG_FILES=true
+      - TAG_KEY=scanned
+      - VOLUME_SIZE=2
+      - PUBLISH_URL=https://some-service.example.com/notification
+    entrypoint:
+      - /root/docker-compose_avscan-script_entrypoint.sh
+    restart: on-failure
+
+  # ClamD service with RestAPI interface
+  # http://localhost:9443/scan
+  clamd-service:
+    image: ajilaag/clamav-rest:20220822
+    ports:
+      - "9443:9443"
+      - "3310:3310"
+    healthcheck:
+      test: ["CMD", "curl", "--silent", "--insecure", "-f", "https://localhost:9443"]
+      interval: 120s
+      timeout: 30s
+      retries: 3
+    volumes:
+      - clamd_virus_definitions:/var/lib/clamav/
+      - clamd_service_log:/var/log/clamav/
+    restart: on-failure
+
+volumes:
+  minio_service_data:
+  rabbitmq_service_queue:
+  rabbitmq_service_log:
+  avscan_script_log:
+  clamd_virus_definitions:
+  clamd_service_log:
+  openssl_certs:
